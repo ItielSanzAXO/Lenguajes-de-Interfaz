@@ -17,9 +17,9 @@ else:
     print("No hay control PS5, funcionará con teclado (2P con flechas).")
 
 # ----------------- LAYOUT GENERAL -----------------
-GAME_W, GAME_H = 880, 600          # área de juego
-LEFT_PANEL_W = 380                 # panel de kernel / HID
-FOOTER_H = 260                     # espacio para el DualSense
+GAME_W, GAME_H = 600, 600          # área de juego (cuadrado para Snake)
+LEFT_PANEL_W = 280                 # panel de kernel / HID (reducido)
+FOOTER_H = 200                     # espacio para el DualSense (reducido)
 SCREEN_W = LEFT_PANEL_W + GAME_W
 SCREEN_H = GAME_H + FOOTER_H
 
@@ -27,7 +27,7 @@ screen_flags = pygame.RESIZABLE
 screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), screen_flags)
 # Superficie lógica donde dibujamos a tamaño base y luego la escalamos a la ventana
 canvas = pygame.Surface((SCREEN_W, SCREEN_H))
-pygame.display.set_caption("Pong Final - Menú, Pausa, DualSense (UI mejorada)")
+pygame.display.set_caption("Snake Final - Menú, Pausa, DualSense (UI mejorada)")
 
 clock = pygame.time.Clock()
 
@@ -40,10 +40,10 @@ font = pygame.font.SysFont("Consolas", 22, bold=True)
 big_font = pygame.font.SysFont("Consolas", 40, bold=True)
 small_font = pygame.font.SysFont("Consolas", 16)
 
-# Constantes del juego
-PADDLE_W = 15
-PADDLE_H = 90
-BALL_SIZE = 14
+# Constantes del juego SNAKE
+GRID_SIZE = 10
+CELL_SIZE = GAME_W // GRID_SIZE  # pixels por celda
+INITIAL_LIVES = 3
 
 # HID labels
 AXIS_LABELS = {
@@ -58,15 +58,33 @@ BUTTON_LABELS = {
     1: "BTN_EAST  (Circle)",
     2: "BTN_WEST  (Square)",
     3: "BTN_NORTH (Triangle)",
-    4: "L1", 5: "R1", 6: "L2", 7: "R2",
-    8: "Share", 9: "Options",
-    10: "L3", 11: "R3"
+    4: "Share", 5: "PS", 6: "Options", 7: "L3",
+    8: "R3", 9: "L1", 10: "R1",
+    # D-Pad como botones en tu mapeo
+    11: "DPad Up", 12: "DPad Down", 13: "DPad Left", 14: "DPad Right",
+    15: "Pad", 16: "MIC"
 }
 
 axis_states = {}
 button_states = {}
 event_log = []
 MAX_LOG = 10
+
+# Estado para evitar logs repetidos por ruido/rumble
+last_axis_values = {}
+hat_states = {}
+input_mute_until = 0  # ms
+
+# Umbrales para registrar cambios en ejes
+AXIS_LOG_THRESHOLD = 0.18  # sólo loguear cambios mayores a este delta
+AXIS_DEADZONE = 0.28      # considerar muerto si dentro de este rango
+
+# RAW signals buffer (kernel -> HID -> datos binarios)
+raw_signals = []  # lista de bytes
+RAW_MAX = 8
+
+# Snapshot of internal memory to display in panel
+kernel_memory = {}
 
 # Glow de botones
 button_glow = {}        # btn_id -> timestamp
@@ -92,26 +110,101 @@ def log_event(text):
 
 def handle_joystick_events(event):
     """Actualiza logs y estados HID."""
-    global axis_states, button_states
+    global axis_states, button_states, last_axis_values, hat_states, input_mute_until
     if not use_controller:
         return
+    now = pygame.time.get_ticks()
+
+    # Si estamos en periodo de mute por vibración, ignorar logs de ejes/HAT
+    muted = now < input_mute_until
 
     if event.type == pygame.JOYBUTTONDOWN:
         btn = event.button
         button_states[btn] = True
         button_glow[btn] = pygame.time.get_ticks()
-        log_event(f"[BTN ↓] {BUTTON_LABELS.get(btn, f'BTN_{btn}')}")
+        log_event(f"[BTN] {BUTTON_LABELS.get(btn, f'BTN_{btn}')}")
+        # RAW: B <btn>
+        try:
+            raw = bytes([0x42, btn & 0xFF])
+            raw_signals.append(raw)
+            if len(raw_signals) > RAW_MAX:
+                raw_signals.pop(0)
+        except Exception:
+            pass
     elif event.type == pygame.JOYBUTTONUP:
         btn = event.button
         button_states[btn] = False
-        log_event(f"[BTN ↑] {BUTTON_LABELS.get(btn, f'BTN_{btn}')}")
+        # No registrar botón al soltar para evitar duplicados en el log
     elif event.type == pygame.JOYAXISMOTION:
         axis = event.axis
         val = joystick.get_axis(axis)
-        axis_states[axis] = val
-        log_event(f"[AXIS] {AXIS_LABELS.get(axis, f'AXIS_{axis}')} = {val:.2f}")
+        prev = last_axis_values.get(axis, 0.0)
+        # Aplicar deadzone: valores pequeños son tratados como 0
+        disp_val = 0.0 if abs(val) < AXIS_DEADZONE else val
+        # Registrar sólo si cambio significativo
+        if not muted and abs(disp_val - prev) > AXIS_LOG_THRESHOLD:
+            axis_states[axis] = val
+            last_axis_values[axis] = disp_val
+            log_event(f"[AXIS] {AXIS_LABELS.get(axis, f'AXIS_{axis}')} = {val:.2f}")
+            # RAW: A <axis> <value8>
+            try:
+                q = int(max(-127, min(127, val * 127)))
+                raw = bytes([0x41, axis & 0xFF, q & 0xFF])
+                raw_signals.append(raw)
+                if len(raw_signals) > RAW_MAX:
+                    raw_signals.pop(0)
+            except Exception:
+                pass
+        else:
+            # Actualizar estado interno sin log si no supera umbral
+            axis_states[axis] = val
+            last_axis_values[axis] = disp_val
     elif event.type == pygame.JOYHATMOTION:
-        log_event(f"[HAT] {event.value}")
+        # Juega with HAT: sólo loguear si cambia respecto estado previo
+        hat_idx = 0
+        prev_hat = hat_states.get(hat_idx, (0, 0))
+        if not muted and event.value != prev_hat:
+            hat_states[hat_idx] = event.value
+            log_event(f"[HAT] {event.value}")
+            # RAW: H <x> <y>
+            try:
+                hx, hy = event.value
+                raw = bytes([0x48, (hx & 0xFF), (hy & 0xFF)])
+                raw_signals.append(raw)
+                if len(raw_signals) > RAW_MAX:
+                    raw_signals.pop(0)
+            except Exception:
+                pass
+        else:
+            hat_states[hat_idx] = event.value
+
+
+def trigger_rumble(joy, duration_ms=200, strong=0.7, weak=0.3):
+    """Intentar activar vibración/rumble de manera segura.
+    - joy: pygame.joystick.Joystick instance
+    """
+    global input_mute_until
+    try:
+        # pygame 2.1+ tiene Joystick.rumble
+        if hasattr(joy, 'rumble'):
+            joy.rumble(strong, weak, int(duration_ms))
+            # Silenciar logs de ejes/HAT durante la vibración (+ pequeño buffer)
+            input_mute_until = pygame.time.get_ticks() + int(duration_ms) + 120
+            return True
+    except Exception:
+        pass
+
+    try:
+        # Intentar usar pygame.haptic (si está disponible y vinculado)
+        if hasattr(pygame, 'haptic'):
+            h = pygame.haptic.Haptic(joy)
+            h.rumble_play(int(duration_ms), int(strong * 0x7fff))
+            input_mute_until = pygame.time.get_ticks() + int(duration_ms) + 120
+            return True
+    except Exception:
+        pass
+
+    return False
 
 def axis_up_down(axis_val, threshold=0.5):
     """Devuelve -1, 0 o 1 según movimiento vertical con deadzone."""
@@ -360,69 +453,130 @@ def draw_dualsense(surface, center_x, center_y, max_w, max_h, axes, btns):
 
 # ----------------- PANEL KERNEL / HID -----------------
 def draw_kernel_panel(surface, pause_buttons):
-    """Panel izquierdo con diseño más bonito para eventos y ejes."""
+    """Panel izquierdo compacto con eventos y ejes HID."""
     # Fondo
     panel_rect = pygame.Rect(0, 0, LEFT_PANEL_W, SCREEN_H)
     pygame.draw.rect(surface, (10, 10, 16), panel_rect)
+    pygame.draw.rect(surface, (50, 70, 120), panel_rect, 2)
 
     # Header general
-    header_rect = pygame.Rect(0, 0, LEFT_PANEL_W, 50)
-    pygame.draw.rect(surface, (18, 18, 26), header_rect)
-    title = font.render("MONITOR HID / KERNEL", True, (220, 220, 255))
-    surface.blit(title, (18, 12))
+    header_rect = pygame.Rect(0, 0, LEFT_PANEL_W, 40)
+    pygame.draw.rect(surface, (18, 18, 28), header_rect)
+    title = small_font.render("HID / KERNEL MONITOR", True, (180, 200, 240))
+    surface.blit(title, (8, 10))
 
     # Línea separadora
-    pygame.draw.line(surface, (70, 70, 90), (0, 50), (LEFT_PANEL_W, 50), 2)
+    pygame.draw.line(surface, (50, 70, 110), (0, 40), (LEFT_PANEL_W, 40), 2)
 
-    # ---- Bloque: Event Log ----
-    block1 = pygame.Rect(16, 64, LEFT_PANEL_W - 32, 220)
-    pygame.draw.rect(surface, (18, 18, 28), block1, border_radius=10)
-    pygame.draw.rect(surface, (40, 120, 200), block1, 1, border_radius=10)
-    h1 = small_font.render("Eventos HID (kernel → pygame)", True, (110, 190, 255))
-    surface.blit(h1, (block1.x + 10, block1.y + 6))
+    # ---- Bloque: Event Log (más compacto) ----
+    block1 = pygame.Rect(8, 50, LEFT_PANEL_W - 16, 140)
+    pygame.draw.rect(surface, (18, 18, 28), block1, border_radius=6)
+    pygame.draw.rect(surface, (40, 120, 180), block1, 1, border_radius=6)
+    h1 = small_font.render("Eventos HID", True, (100, 180, 255))
+    surface.blit(h1, (block1.x + 8, block1.y + 4))
 
-    y = block1.y + 30
-    for line in event_log[-7:]:
-        bullet = small_font.render("•", True, (0, 255, 150))
-        surface.blit(bullet, (block1.x + 12, y))
-        t = small_font.render(line, True, (210, 210, 210))
-        surface.blit(t, (block1.x + 24, y))
+    y = block1.y + 22
+    for line in event_log[-5:]:
+        bullet = small_font.render("•", True, (100, 255, 150))
+        surface.blit(bullet, (block1.x + 8, y))
+        t = small_font.render(line, True, (190, 190, 190))
+        surface.blit(t, (block1.x + 18, y))
         y += 20
 
-    # ---- Bloque: Axis States ----
-    block2 = pygame.Rect(16, 300, LEFT_PANEL_W - 32, 220)
-    pygame.draw.rect(surface, (18, 18, 28), block2, border_radius=10)
-    pygame.draw.rect(surface, (220, 190, 70), block2, 1, border_radius=10)
-    h2 = small_font.render("Ejes HID (estado actual)", True, (255, 220, 90))
-    surface.blit(h2, (block2.x + 10, block2.y + 6))
+    # ---- Bloque: Axis States (más compacto) ----
+    # Acortamos este bloque para que termine justo después del segundo 'Right'
+    block2 = pygame.Rect(8, 200, LEFT_PANEL_W - 16, 110)
+    pygame.draw.rect(surface, (18, 18, 28), block2, border_radius=6)
+    pygame.draw.rect(surface, (200, 170, 60), block2, 1, border_radius=6)
+    h2 = small_font.render("Joystick Izq.", True, (255, 200, 80))
+    surface.blit(h2, (block2.x + 8, block2.y + 4))
 
-    y = block2.y + 30
-    for idx in sorted(axis_states.keys()):
-        label = AXIS_LABELS.get(idx, f"AXIS_{idx}")
-        val = axis_states[idx]
-        t = small_font.render(f"{label}: {val:+.2f}", True, (230, 230, 230))
-        surface.blit(t, (block2.x + 10, y))
-        y += 20
+    y = block2.y + 22
+    # Solo mostrar L-stick y R2 (eje 2 y 3)
+    for idx in [0, 1, 2, 3]:
+        if idx in axis_states:
+            label = AXIS_LABELS.get(idx, f"AXIS_{idx}").split("(")[1].strip(")")  # Solo la parte entre paréntesis
+            val = axis_states[idx]
+            bar_width = int(abs(val) * 30)
+            color = (100, 200, 100) if val >= 0 else (255, 100, 100)
+            t = small_font.render(f"{label[:6]}: {val:+.1f}", True, (200, 200, 200))
+            surface.blit(t, (block2.x + 8, y))
+            pygame.draw.rect(surface, color, (block2.x + 70, y + 2, bar_width, 12))
+            y += 18
 
-    # Info de botón de pausa
+    # ---- Bloque: Señales RAW (Hex / Bin) ----
+    block3 = pygame.Rect(8, block2.y + block2.height + 12, LEFT_PANEL_W - 16, 110)
+    pygame.draw.rect(surface, (18, 18, 28), block3, border_radius=6)
+    pygame.draw.rect(surface, (80, 160, 200), block3, 1, border_radius=6)
+    h3 = small_font.render("Señales RAW (Hex / Bin)", True, (140, 220, 240))
+    surface.blit(h3, (block3.x + 8, block3.y + 4))
+
+    ry = block3.y + 22
+    # Mostrar las últimas señales RAW (más recientes abajo)
+    raw_to_show = raw_signals[-5:]
+    for raw in raw_to_show:
+        try:
+            hex_str = ' '.join(f"{b:02X}" for b in raw)
+            bin_str = ' '.join(f"{b:08b}" for b in raw)
+            t1 = small_font.render(hex_str, True, (200, 200, 200))
+            surface.blit(t1, (block3.x + 8, ry))
+            ry += 16
+            t2 = small_font.render(bin_str, True, (120, 180, 180))
+            surface.blit(t2, (block3.x + 10, ry))
+            ry += 14
+        except Exception:
+            continue
+
+    # ---- Bloque: Estado Interno (Ciclo Von Neumann) ----
+    block4 = pygame.Rect(8, block3.y + block3.height + 12, LEFT_PANEL_W - 16, 160)
+    pygame.draw.rect(surface, (18, 18, 28), block4, border_radius=6)
+    pygame.draw.rect(surface, (200, 160, 80), block4, 1, border_radius=6)
+    h4 = small_font.render("Estado Interno (Ciclo Von Neumann)", True, (240, 200, 140))
+    surface.blit(h4, (block4.x + 8, block4.y + 4))
+
+    ry = block4.y + 22
+    # Mostrar snapshot de kernel_memory
+    km = kernel_memory
+    lines = []
+    try:
+        lines.append(f"SCORE={km.get('score', '-')}")
+        lines.append(f"VIDAS={km.get('lives', '-')}")
+        lines.append(f"LEN={km.get('len_snake', '-')}")
+        lines.append(f"DIR={km.get('direction', '-')}")
+        lines.append(f"NEXT={km.get('next_direction', '-')}")
+        lines.append(f"SPD={km.get('speed', '-')}")
+        lines.append(f"FRAME={km.get('frame_count', '-')}")
+        im = km.get('input_mute', 0)
+        lines.append(f"MUTE(ms)={max(0, int(im))}")
+        lines.append(f"RAW={km.get('raw_count', 0)}")
+        lines.append(f"P={km.get('particles', 0)}")
+    except Exception:
+        lines = ["-"]
+
+    for ln in lines[:8]:
+        t = small_font.render(ln, True, (200, 200, 200))
+        surface.blit(t, (block4.x + 8, ry))
+        ry += 16
+
+    # Info de pausa
     txt = ", ".join(f"B{b}" for b in pause_buttons) if pause_buttons else "-"
-    bottom_label = small_font.render(f"Pausa: {txt} / Teclado: P o ESC", True, (160, 160, 220))
-    surface.blit(bottom_label, (18, SCREEN_H - 30))
+    bottom_label = small_font.render(f"Pausa: {txt}", True, (140, 140, 200))
+    surface.blit(bottom_label, (8, SCREEN_H - 30))
 
-# ----------------- MENÚ PRINCIPAL -----------------
+# -----------------  MENÚ PRINCIPAL -----------------
 def draw_menu(selected_index):
     canvas.fill((5, 5, 12))
-    title = big_font.render("P O N G", True, (255, 255, 255))
+    title = big_font.render("S N A K E", True, (255, 255, 255))
     canvas.blit(title, (SCREEN_W // 2 - title.get_width() // 2, 80))
 
-    options = ["1 Jugador (vs CPU)", "2 Jugadores", "Salir"]
+    options = ["Jugar", "Salir"]
     for i, text in enumerate(options):
         color = (255, 255, 0) if i == selected_index else (200, 200, 200)
         t = font.render(text, True, color)
         canvas.blit(t, (SCREEN_W // 2 - t.get_width() // 2, 220 + i * 60))
 
     info = small_font.render(
-        "Mover: ↑/↓ o D-Pad/Stick  |  Seleccionar: Enter / X",
+        "Mover: ↑/↓/←/→ o D-Pad/L-Stick  |  Seleccionar: Enter / X",
         True, (150, 150, 150)
     )
     canvas.blit(info, (SCREEN_W // 2 - info.get_width() // 2, SCREEN_H - 60))
@@ -441,10 +595,10 @@ def menu_loop():
             # Teclado
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_UP:
-                    selected = (selected - 1) % 3
+                    selected = (selected - 1) % 2
                     menu_sound.play()
                 elif event.key == pygame.K_DOWN:
-                    selected = (selected + 1) % 3
+                    selected = (selected + 1) % 2
                     menu_sound.play()
                 elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
                     menu_sound.play()
@@ -453,18 +607,30 @@ def menu_loop():
             # Control
             if use_controller:
                 handle_joystick_events(event)
+                # Selección con X
                 if event.type == pygame.JOYBUTTONDOWN and event.button == 0:  # X
                     menu_sound.play()
                     return selected
+                # D-pad mapeado como botones (11 arriba, 12 abajo)
+                if event.type == pygame.JOYBUTTONDOWN and event.button in (11, 12):
+                    now = pygame.time.get_ticks()
+                    if event.button == 11 and now - last_move > cooldown:
+                        selected = (selected - 1) % 2
+                        last_move = now
+                        menu_sound.play()
+                    if event.button == 12 and now - last_move > cooldown:
+                        selected = (selected + 1) % 2
+                        last_move = now
+                        menu_sound.play()
                 if event.type == pygame.JOYHATMOTION:
                     hat_x, hat_y = event.value
                     now = pygame.time.get_ticks()
                     if hat_y == 1 and now - last_move > cooldown:
-                        selected = (selected - 1) % 3
+                        selected = (selected - 1) % 2
                         last_move = now
                         menu_sound.play()
                     if hat_y == -1 and now - last_move > cooldown:
-                        selected = (selected + 1) % 3
+                        selected = (selected + 1) % 2
                         last_move = now
                         menu_sound.play()
 
@@ -474,7 +640,7 @@ def menu_loop():
             direction = axis_up_down(axis_val, 0.6)
             now = pygame.time.get_ticks()
             if direction != 0 and now - last_move > cooldown:
-                selected = (selected + direction) % 3
+                selected = (selected + direction) % 2
                 last_move = now
                 menu_sound.play()
 
@@ -487,6 +653,9 @@ def pause_menu():
     selected = 0
     last_move = 0
     cooldown = 200
+
+    # Limpiar log de eventos al entrar en pausa
+    event_log.clear()
 
     # Pantalla completa (toda la ventana lógica)
     overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
@@ -538,6 +707,18 @@ def pause_menu():
                         menu_sound.play()
                         return "resume" if selected == 0 else "menu"
 
+                # D-pad mapeado a botones (11 arriba, 12 abajo)
+                if event.type == pygame.JOYBUTTONDOWN and event.button in (11, 12):
+                    now = pygame.time.get_ticks()
+                    if event.button == 11 and now - last_move > cooldown:
+                        selected = (selected - 1) % 2
+                        last_move = now
+                        menu_sound.play()
+                    if event.button == 12 and now - last_move > cooldown:
+                        selected = (selected + 1) % 2
+                        last_move = now
+                        menu_sound.play()
+
                 # Stick vertical
                 if event.type == pygame.JOYAXISMOTION:
                     axis = joystick.get_axis(1)
@@ -580,33 +761,55 @@ def game_loop(mode):
         pause_buttons.append(9)
 
     """
-    mode = 0 -> 1 Jugador (vs CPU)
-    mode = 1 -> 2 Jugadores
+    Juego de Snake en un mapa de 10x10
     """
     global axis_states, button_states
+    # Limpiar log de eventos al iniciar la partida
+    event_log.clear()
 
     # Estados HID
     if use_controller:
         axis_states = {i: 0.0 for i in range(joystick.get_numaxes())}
         button_states = {i: False for i in range(joystick.get_numbuttons())}
+        # inicializar valores previos para debounce
+        last_axis_values = {i: 0.0 for i in range(joystick.get_numaxes())}
+        # Inicializar hat_states (asumir un hat index 0 si existe)
+        hat_states = {0: (0, 0)} if joystick.get_numhats() > 0 else {}
         pause_buttons = [9, 10, 16]  # distintos drivers mapean Options aquí
     else:
         axis_states = {}
         button_states = {}
         pause_buttons = []
 
-    # Paletas y pelota
-    p1_y = GAME_H // 2 - PADDLE_H // 2
-    p2_y = GAME_H // 2 - PADDLE_H // 2
-    ball_x = GAME_W // 2
-    ball_y = GAME_H // 2
-    ball_vx = 6
-    ball_vy = 6
+    # Vidas
+    lives = INITIAL_LIVES
+
+    # Inicializar Snake
+    snake = [(5, 5), (4, 5), (3, 5)]  # Lista de segmentos (cabeza primero)
+    direction = (1, 0)  # Dirección (dx, dy)
+    next_direction = (1, 0)
+    food = (7, 7)
     score = 0
-    cpu_speed = 6
+    game_over_flag = False
+    
+    # Velocidad del juego (frames entre movimientos)
+    speed = 10
+    frame_count = 0
+    # Partículas al comer (inicializadas más abajo cuando conocemos origen de juego)
+    particles = []  # cada partícula: dict{x,y,vx,vy,life,maxlife,clr,size}
+    
+    # Controles
+    last_move_time = pygame.time.get_ticks()
+    move_cooldown = 100  # ms para evitar múltiples movimientos rápidos
 
     game_origin_x = LEFT_PANEL_W
     game_origin_y = 0
+
+    # Posiciones usadas para dibujar suavemente (pixeles)
+    draw_positions = [
+        (game_origin_x + x * CELL_SIZE + 2, game_origin_y + y * CELL_SIZE + 2)
+        for (x, y) in snake
+    ]
 
     while True:
         for event in pygame.event.get():
@@ -621,98 +824,386 @@ def game_loop(mode):
                     if result == "menu":
                         return
 
+                # Controles con D-pad (HAT)
+                if event.type == pygame.JOYHATMOTION:
+                    hat_x, hat_y = event.value
+                    now = pygame.time.get_ticks()
+                    if now - last_move_time > move_cooldown:
+                        if hat_y == 1 and direction != (0, 1):  # Arriba
+                            next_direction = (0, -1)
+                            last_move_time = now
+                        elif hat_y == -1 and direction != (0, -1):  # Abajo
+                            next_direction = (0, 1)
+                            last_move_time = now
+                        elif hat_x == -1 and direction != (1, 0):  # Izquierda
+                            next_direction = (-1, 0)
+                            last_move_time = now
+                        elif hat_x == 1 and direction != (-1, 0):  # Derecha
+                            next_direction = (1, 0)
+                            last_move_time = now
+
+                # Controles con botones (D-pad mapeado 11..14, face buttons 0..3, L1/R1)
+                if event.type == pygame.JOYBUTTONDOWN:
+                    btn = event.button
+                    now = pygame.time.get_ticks()
+                    # Movimientos D-pad mapeados como botones
+                    if now - last_move_time > move_cooldown:
+                        if btn == 11 and direction != (0, 1):  # DPad Arriba
+                            next_direction = (0, -1)
+                            last_move_time = now
+                        elif btn == 12 and direction != (0, -1):  # DPad Abajo
+                            next_direction = (0, 1)
+                            last_move_time = now
+                        elif btn == 13 and direction != (1, 0):  # DPad Izquierda
+                            next_direction = (-1, 0)
+                            last_move_time = now
+                        elif btn == 14 and direction != (-1, 0):  # DPad Derecha
+                            next_direction = (1, 0)
+                            last_move_time = now
+
+                    # Face buttons como movimiento (Triangle=3 Up, Circle=1 Right, X=0 Down, Square=2 Left)
+                    if now - last_move_time > move_cooldown:
+                        if btn == 3 and direction != (0, 1):
+                            next_direction = (0, -1)
+                            last_move_time = now
+                        elif btn == 1 and direction != (-1, 0):
+                            next_direction = (1, 0)
+                            last_move_time = now
+                        elif btn == 0 and direction != (0, -1):
+                            next_direction = (0, 1)
+                            last_move_time = now
+                        elif btn == 2 and direction != (1, 0):
+                            next_direction = (-1, 0)
+                            last_move_time = now
+
+                    # L1 / R1 para ajustar velocidad
+                    if btn == 9:  # L1
+                        speed = max(2, speed - 1)
+                        log_event(f"Speed: {speed}")
+                    elif btn == 10:  # R1
+                        speed = min(30, speed + 1)
+                        log_event(f"Speed: {speed}")
+
             if event.type == pygame.KEYDOWN:
                 if event.key in (pygame.K_p, pygame.K_ESCAPE):
                     menu_sound.play()
                     result = pause_menu()
                     if result == "menu":
                         return
+                # Controles de teclado
+                if event.key == pygame.K_UP and direction != (0, 1):
+                    next_direction = (0, -1)
+                elif event.key == pygame.K_DOWN and direction != (0, -1):
+                    next_direction = (0, 1)
+                elif event.key == pygame.K_LEFT and direction != (1, 0):
+                    next_direction = (-1, 0)
+                elif event.key == pygame.K_RIGHT and direction != (-1, 0):
+                    next_direction = (1, 0)
 
-        keys = pygame.key.get_pressed()
-
-        # Player 1
+        # Controles con joystick izquierdo
         if use_controller:
+            now = pygame.time.get_ticks()
+            lx = axis_states.get(0, 0.0)
             ly = axis_states.get(1, 0.0)
-            if abs(ly) > 0.15:
-                p1_y += ly * 7
-        else:
-            if keys[pygame.K_w]:
-                p1_y -= 7
-            if keys[pygame.K_s]:
-                p1_y += 7
+            
+            # Determinar dirección según stick izquierdo
+            if now - last_move_time > move_cooldown:
+                if abs(lx) > abs(ly):  # Movimiento horizontal dominante
+                    if lx < -0.5 and direction != (1, 0):
+                        next_direction = (-1, 0)
+                        last_move_time = now
+                    elif lx > 0.5 and direction != (-1, 0):
+                        next_direction = (1, 0)
+                        last_move_time = now
+                else:  # Movimiento vertical dominante
+                    if ly < -0.5 and direction != (0, 1):
+                        next_direction = (0, -1)
+                        last_move_time = now
+                    elif ly > 0.5 and direction != (0, -1):
+                        next_direction = (0, 1)
+                        last_move_time = now
 
-        # Player 2
-        if mode == 0:  # CPU
-            if p2_y + PADDLE_H/2 < ball_y:
-                p2_y += cpu_speed
-            else:
-                p2_y -= cpu_speed
-        else:          # 2 jugadores (flechas)
-            if keys[pygame.K_UP]:
-                p2_y -= 7
-            if keys[pygame.K_DOWN]:
-                p2_y += 7
+            # También aceptar stick derecho (axes 2/3) como alternativa
+            rx = axis_states.get(2, 0.0)
+            ry = axis_states.get(3, 0.0)
+            if now - last_move_time > move_cooldown:
+                if abs(rx) > abs(ry):
+                    if rx < -0.5 and direction != (1, 0):
+                        next_direction = (-1, 0)
+                        last_move_time = now
+                    elif rx > 0.5 and direction != (-1, 0):
+                        next_direction = (1, 0)
+                        last_move_time = now
+                else:
+                    if ry < -0.5 and direction != (0, 1):
+                        next_direction = (0, -1)
+                        last_move_time = now
+                    elif ry > 0.5 and direction != (0, -1):
+                        next_direction = (0, 1)
+                        last_move_time = now
 
-        p1_y = max(0, min(GAME_H - PADDLE_H, p1_y))
-        p2_y = max(0, min(GAME_H - PADDLE_H, p2_y))
+        # Actualizar dirección si no hace un giro de 180°
+        direction = next_direction
 
-        # Movimiento pelota
-        ball_x += ball_vx
-        ball_y += ball_vy
+        # Mover serpiente
+        frame_count += 1
+        if frame_count >= speed:
+            frame_count = 0
+            
+            # Calcular nueva cabeza
+            head_x, head_y = snake[0]
+            dx, dy = direction
+            new_head = (head_x + dx, new_head_y := head_y + dy)
+            
+            # Comprobar colisiones con bordes o consigo misma => perder vida
+            died = False
+            if new_head[0] < 0 or new_head[0] >= GRID_SIZE or new_head[1] < 0 or new_head[1] >= GRID_SIZE:
+                died = True
+            if new_head in snake:
+                died = True
 
-        # Rebotes verticales
-        if ball_y <= 0 or ball_y >= GAME_H - BALL_SIZE:
-            ball_vy *= -1
-            hit_sound.play()
-
-        # Rebotes horizontal / puntos
-        if ball_x <= 60 + PADDLE_W:
-            if p1_y <= ball_y <= p1_y + PADDLE_H:
-                ball_vx *= -1
-                hit_sound.play()
-                score += 1
-            else:
-                ball_x, ball_y = GAME_W // 2, GAME_H // 2
-                ball_vx, ball_vy = 6, 6
-                score = 0
+            if died:
+                # Restar vida y reiniciar si quedan vidas
+                lives -= 1
+                log_event(f"Vida perdida! Quedan: {lives}")
                 point_sound.play()
-
-        if ball_x >= GAME_W - 60 - PADDLE_W - BALL_SIZE:
-            if p2_y <= ball_y <= p2_y + PADDLE_H:
-                ball_vx *= -1
+                try:
+                    if use_controller:
+                        trigger_rumble(joystick, duration_ms=350, strong=1.0, weak=0.6)
+                except Exception:
+                    pass
+                pygame.time.wait(600)
+                # Si no quedan vidas, game over y volver al menú
+                if lives <= 0:
+                    # Limpiar log y volver al menú
+                    event_log.clear()
+                    pygame.time.wait(300)
+                    return
+                # Si quedan vidas, reiniciar serpiente y estado
+                snake = [(5, 5), (4, 5), (3, 5)]
+                direction = (1, 0)
+                next_direction = (1, 0)
+                # Regenerar comida fuera de la serpiente
+                import random
+                while True:
+                    food = (random.randint(0, GRID_SIZE - 1), random.randint(0, GRID_SIZE - 1))
+                    if food not in snake:
+                        break
+                # Reset draw positions and particles
+                draw_positions = [
+                    (game_origin_x + x * CELL_SIZE + 2, game_origin_y + y * CELL_SIZE + 2)
+                    for (x, y) in snake
+                ]
+                particles = []
+                # Continuar al siguiente frame sin crecer
+                continue
+            
+            # Agregar cabeza
+            snake.insert(0, new_head)
+            
+            # Comprobar si comió comida
+            if new_head == food:
+                score += 10
                 hit_sound.play()
+                # Vibrar control si está disponible
+                try:
+                    if use_controller:
+                        trigger_rumble(joystick, duration_ms=220, strong=0.9, weak=0.4)
+                except Exception:
+                    pass
+                # Generar partículas al comer
+                import random
+                cx = game_origin_x + new_head[0] * CELL_SIZE + CELL_SIZE / 2
+                cy = game_origin_y + new_head[1] * CELL_SIZE + CELL_SIZE / 2
+                for _ in range(12):
+                    particles.append({
+                        'x': cx,
+                        'y': cy,
+                        'vx': random.uniform(-2.5, 2.5),
+                        'vy': random.uniform(-2.5, 2.5),
+                        'life': random.randint(18, 36),
+                        'maxlife': 36,
+                        'clr': (255, 170, 60),
+                        'size': random.randint(2, 5)
+                    })
+                # Generar nueva comida en posición aleatoria
+                while True:
+                    food = (random.randint(0, GRID_SIZE - 1), random.randint(0, GRID_SIZE - 1))
+                    if food not in snake:
+                        break
             else:
-                ball_x, ball_y = GAME_W // 2, GAME_H // 2
-                ball_vx, ball_vy = -6, 6
-                score = 0
-                point_sound.play()
+                # Si no comió, quitar último segmento
+                snake.pop()
 
         # ----------------- DIBUJAR -----------------
-        canvas.fill((12, 12, 18))
+        # Actualizar snapshot del kernel (estado interno) para panel
+        try:
+            kernel_memory['score'] = score
+            kernel_memory['lives'] = lives
+            kernel_memory['len_snake'] = len(snake)
+            kernel_memory['direction'] = direction
+            kernel_memory['next_direction'] = next_direction
+            kernel_memory['speed'] = speed
+            kernel_memory['frame_count'] = frame_count
+            kernel_memory['input_mute'] = input_mute_until - pygame.time.get_ticks()
+            kernel_memory['raw_count'] = len(raw_signals)
+            kernel_memory['particles'] = len(particles)
+            kernel_memory['draw_positions'] = len(draw_positions)
+            # Snapshot of axis short form
+            kernel_memory['axes'] = {k: round(v, 2) for k, v in axis_states.items()} if axis_states else {}
+            kernel_memory['buttons_pressed'] = [b for b, v in button_states.items() if v]
+        except Exception:
+            pass
+        # Fondo general
+        canvas.fill((8, 8, 14))
 
         # Panel kernel/HID
         draw_kernel_panel(canvas, pause_buttons)
 
-        # Área de juego
-        pygame.draw.rect(canvas, (0, 0, 0), (game_origin_x, game_origin_y, GAME_W, GAME_H))
+        # Área de juego: tablero tipo ajedrez con dos tonos de verde
+        light_green = (40, 160, 60)
+        dark_green = (20, 110, 35)
+        cell_margin = 0
+        for gx in range(GRID_SIZE):
+            for gy in range(GRID_SIZE):
+                col = light_green if ((gx + gy) % 2 == 0) else dark_green
+                rx = game_origin_x + gx * CELL_SIZE + cell_margin
+                ry = game_origin_y + gy * CELL_SIZE + cell_margin
+                rw = CELL_SIZE - cell_margin * 2
+                rh = CELL_SIZE - cell_margin * 2
+                pygame.draw.rect(canvas, col, (rx, ry, rw, rh))
+        # Borde del área de juego
+        pygame.draw.rect(canvas, (10, 40, 20), (game_origin_x, game_origin_y, GAME_W, GAME_H), 4, border_radius=6)
 
-        # Score
-        score_text = font.render(f"SCORE: {score}", True, (255, 255, 255))
+        # Dibujar comida (efecto pulsante)
+        food_x, food_y = food
+        food_rect = pygame.Rect(
+            game_origin_x + food_x * CELL_SIZE + 2,
+            game_origin_y + food_y * CELL_SIZE + 2,
+            CELL_SIZE - 4, CELL_SIZE - 4
+        )
+        pulse = abs(pygame.time.get_ticks() % 600 - 300) / 300.0
+        food_color = (
+            int(255 * (0.6 + 0.4 * pulse)),
+            int(100 * (0.6 + 0.4 * pulse)),
+            int(80 * (0.6 + 0.4 * pulse))
+        )
+        pygame.draw.ellipse(canvas, food_color, food_rect)
+        pygame.draw.ellipse(canvas, (255, 150, 100), food_rect, 2)
+        center_x = food_rect.centerx
+        center_y = food_rect.centery
+        pygame.gfxdraw.filled_circle(canvas, int(center_x), int(center_y - CELL_SIZE // 8), 3, (255, 200, 150))
+
+        # Actualizar posiciones dibujadas (suavizado) y dibujar serpiente
+        smoothing = 0.32
+        # Ajustar draw_positions si la longitud cambió
+        if len(draw_positions) < len(snake):
+            if draw_positions:
+                draw_positions.insert(0, draw_positions[0])
+            else:
+                draw_positions.insert(0, (game_origin_x + snake[0][0] * CELL_SIZE + 2, game_origin_y + snake[0][1] * CELL_SIZE + 2))
+        while len(draw_positions) > len(snake):
+            draw_positions.pop()
+
+        tail_index = len(snake) - 1
+        for i, (sx, sy) in enumerate(snake):
+            target_x = game_origin_x + sx * CELL_SIZE + 2
+            target_y = game_origin_y + sy * CELL_SIZE + 2
+            cur_x, cur_y = draw_positions[i]
+            nx = cur_x + (target_x - cur_x) * smoothing
+            ny = cur_y + (target_y - cur_y) * smoothing
+            draw_positions[i] = (nx, ny)
+
+            seg_rect = pygame.Rect(int(nx), int(ny), CELL_SIZE - 4, CELL_SIZE - 4)
+            # Cabeza
+            if i == 0:
+                # Outer border (dark blue)
+                pygame.draw.rect(canvas, (6, 18, 60), seg_rect.inflate(4, 4), border_radius=8)
+                # Main head gradient (top -> bottom, light blue to deep blue)
+                head_grad = pygame.Surface((seg_rect.width, seg_rect.height))
+                top_col = (180, 220, 255)
+                bot_col = (30, 80, 200)
+                for yy in range(seg_rect.height):
+                    t = yy / max(1, seg_rect.height - 1)
+                    r = int(top_col[0] * (1 - t) + bot_col[0] * t)
+                    g = int(top_col[1] * (1 - t) + bot_col[1] * t)
+                    b = int(top_col[2] * (1 - t) + bot_col[2] * t)
+                    pygame.draw.line(head_grad, (r, g, b), (0, yy), (seg_rect.width, yy))
+                canvas.blit(head_grad, (seg_rect.x, seg_rect.y))
+                pygame.draw.rect(canvas, (220, 240, 255), seg_rect, 2, border_radius=8)
+                # Ojos (oscuro)
+                eye_x = seg_rect.x + seg_rect.width // 3
+                eye_y = seg_rect.y + seg_rect.height // 3
+                pygame.gfxdraw.filled_circle(canvas, int(eye_x), int(eye_y), 3, (8, 12, 18))
+                pygame.gfxdraw.filled_circle(canvas, int(eye_x + seg_rect.width // 3), int(eye_y), 3, (8, 12, 18))
+                # Brillo superior (sutil)
+                shine = pygame.Surface((seg_rect.width, max(2, seg_rect.height // 3)), pygame.SRCALPHA)
+                pygame.draw.ellipse(shine, (255, 255, 255, 36), (0, 0, seg_rect.width, seg_rect.height // 2))
+                canvas.blit(shine, (seg_rect.x, seg_rect.y - seg_rect.height // 6))
+            # Cola
+            elif i == tail_index:
+                tail_color = (10, 30, 120)
+                pygame.draw.rect(canvas, tail_color, seg_rect, border_radius=4)
+                pygame.draw.rect(canvas, (40, 80, 160), seg_rect, 1, border_radius=4)
+                # Small tip circle indicating tail end (darker blue)
+                try:
+                    if len(snake) >= 2:
+                        tx, ty = snake[-1]
+                        px, py = snake[-2]
+                        dx_t = tx - px
+                        dy_t = ty - py
+                        tip_x = seg_rect.centerx + dx_t * (CELL_SIZE // 4)
+                        tip_y = seg_rect.centery + dy_t * (CELL_SIZE // 4)
+                        pygame.gfxdraw.filled_circle(canvas, int(tip_x), int(tip_y), 3, (5, 10, 40))
+                except Exception:
+                    pass
+            else:
+                depth = int(180 - min(100, i * 5))
+                body_color = (30, 80, max(80, depth))
+                pygame.draw.rect(canvas, body_color, seg_rect, border_radius=4)
+                pygame.draw.rect(canvas, (90, 140, 220), seg_rect, 1, border_radius=4)
+
+        # Dibujar partículas y actualizar
+        new_particles = []
+        for p in particles:
+            p['x'] += p['vx']
+            p['y'] += p['vy']
+            p['vx'] *= 0.96
+            p['vy'] *= 0.96
+            p['life'] -= 1
+            alpha = int(255 * (p['life'] / p['maxlife']))
+            if alpha > 0:
+                surf = pygame.Surface((p['size'] * 2, p['size'] * 2), pygame.SRCALPHA)
+                pygame.gfxdraw.filled_circle(surf, p['size'], p['size'], p['size'], (*p['clr'], alpha))
+                canvas.blit(surf, (int(p['x'] - p['size']), int(p['y'] - p['size'])))
+                new_particles.append(p)
+        particles = new_particles
+
+        # Score y vidas (estilo retro verde)
+        score_text = font.render(f"SCORE: {score} | LONGITUD: {len(snake)}", True, (160, 255, 140))
         canvas.blit(score_text, (
             game_origin_x + GAME_W // 2 - score_text.get_width() // 2,
-            10
+            8
         ))
 
-        # Paletas
-        pygame.draw.rect(canvas, (255, 255, 255),
-                         (game_origin_x + 60, game_origin_y + p1_y, PADDLE_W, PADDLE_H))
-        pygame.draw.rect(canvas, (255, 255, 255),
-                         (game_origin_x + GAME_W - 60 - PADDLE_W, game_origin_y + p2_y,
-                          PADDLE_W, PADDLE_H))
-
-        # Pelota
-        pygame.draw.rect(canvas, (255, 255, 255),
-                         (game_origin_x + ball_x, game_origin_y + ball_y, BALL_SIZE, BALL_SIZE))
+        # Dibujar vidas como corazones pixel-art en la esquina superior izquierda del área de juego
+        heart_base_x = game_origin_x + 8
+        heart_base_y = 8
+        heart_gap = 6
+        # Corazones en rojo
+        heart_color = (220, 20, 60)
+        dark_color = (110, 20, 30)
+        for i in range(lives):
+            hx = heart_base_x + i * (CELL_SIZE // 2 + heart_gap)
+            hy = heart_base_y
+            # Dibujar corazón simple: dos círculos y un triángulo/rect
+            # círculos
+            pygame.gfxdraw.filled_circle(canvas, hx + 3, hy + 3, 3, heart_color)
+            pygame.gfxdraw.filled_circle(canvas, hx + 8, hy + 3, 3, heart_color)
+            # parte inferior
+            pts = [(hx + 1, hy + 5), (hx + 10, hy + 5), (hx + 5, hy + 11)]
+            pygame.draw.polygon(canvas, heart_color, pts)
+            pygame.draw.polygon(canvas, dark_color, pts, 1)
 
         # Footer para DualSense
         footer_rect = pygame.Rect(0, GAME_H, SCREEN_W, FOOTER_H)
@@ -730,18 +1221,15 @@ def game_loop(mode):
             btns=button_states
         )
 
-
         present_frame()
         clock.tick(60)
 
-# ----------------- MAIN -----------------
+# -----------------  MAIN -----------------
 if __name__ == "__main__":
     while True:
-        opt = menu_loop()   # 0 = 1P, 1 = 2P, 2 = salir
+        opt = menu_loop()   # 0 = Jugar, 1 = Salir
         if opt == 0:
             game_loop(0)
-        elif opt == 1:
-            game_loop(1)
         else:
             pygame.quit()
             sys.exit()
